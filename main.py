@@ -70,7 +70,18 @@ def exclusions(kind='genre'):
 
 def search_books(query: str, limit=8) -> list[dict[str,str]]:
     params={'q':query,'maxResults':limit,'printType':'books','langRestrict':'it'}
-    r=requests.get('https://www.googleapis.com/books/v1/volumes',params=params,timeout=20); r.raise_for_status()
+    r=requests.get(
+    'https://www.googleapis.com/books/v1/volumes',
+    params=params,
+    timeout=20
+)
+if not r.ok:
+    logging.error(
+        'Google Books HTTP %s: %s',
+        r.status_code,
+        r.text[:1000]
+    )
+    r.raise_for_status()
     out=[]
     for item in r.json().get('items',[]):
         v=item.get('volumeInfo',{}); ids=v.get('industryIdentifiers',[])
