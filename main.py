@@ -69,60 +69,84 @@ def exclusions(kind='genre'):
     with db() as con: return [r['value'] for r in con.execute('SELECT value FROM exclusions WHERE kind=? ORDER BY value',(kind,))]
 
 
+
 def search_books(query: str, limit=8) -> list[dict[str, str]]:
     params = {
         'q': query,
-        'maxResults': limit,
-        'printType': 'books',
-        'langRestrict': 'it'
+        'limit': min(max(int(limit), 1), 20),
+        'lang': 'it',
+        'fields': 'key,title,author_name,first_publish_year,publisher,subject,isbn,cover_i,language,first_sentence'
     }
 
-    r = requests.get(
-        'https://www.googleapis.com/books/v1/volumes',
-        params=params,
-        timeout=20
-    )
-
-    if not r.ok:
-        logging.error(
-            'Google Books HTTP %s: %s',
-            r.status_code,
-            r.text[:1000]
+    try:
+        r = requests.get(
+            'https://openlibrary.org/search.json',
+            params=params,
+            headers={
+                'User-Agent': 'BookHunterTelegramBot/1.0'
+            },
+            timeout=20
         )
         r.raise_for_status()
 
-    out = []
+        data = r.json()
+        out = []
 
-    for item in r.json().get('items', []):
-        v = item.get('volumeInfo', {})
-        ids = v.get('industryIdentifiers', [])
+        for item in data.get('docs', []):
+            title = item.get('title') or 'Titolo non disponibile'
 
-        isbn = next(
-            (
-                x.get('identifier', '')
-                for x in ids
-                if x.get('type') in ('ISBN_13', 'ISBN_10')
-            ),
-            ''
-        )
+            authors = ', '.join(
+                item.get('author_name', [])
+            )
 
-        out.append({
-            'title': v.get('title', 'Titolo non disponibile'),
-            'authors': ', '.join(v.get('authors', [])),
-            'publisher': v.get('publisher', ''),
-            'published': v.get('publishedDate', ''),
-            'description': re.sub(
-                r'<[^>]+>',
-                ' ',
-                v.get('description', '')
-            )[:1200],
-            'categories': ', '.join(v.get('categories', [])),
-            'isbn': isbn,
-            'link': v.get('infoLink', ''),
-            'source': 'Google Books'
-        })
+            publishers = ', '.join(
+                item.get('publisher', [])[:3]
+            )
 
-    return out
+            subjects = ', '.join(
+                item.get('subject', [])[:10]
+            )
+
+            isbn = next(
+                iter(item.get('isbn', [])),
+                ''
+            )
+
+            sentences = item.get('first_sentence', [])
+            if isinstance(sentences, list):
+                description = ' '.join(str(s) for s in sentences)
+            elif isinstance(sentences, str):
+                description = sentences
+            else:
+                description = ''
+
+            key = item.get('key', '')
+            link = (
+                'https://openlibrary.org' + key
+                if key else ''
+            )
+
+            out.append({
+                'title': title,
+                'authors': authors,
+                'publisher': publishers,
+                'published': str(item.get('first_publish_year', '')),
+                'description': description[:1200],
+                'categories': subjects,
+                'isbn': isbn,
+                'link': link,
+                'source': 'Open Library'
+            })
+
+        return out
+
+    except requests.exceptions.RequestException as e:
+        log.exception('Open Library search failed: %s', e)
+        raise
+    except (ValueError, TypeError, KeyError) as e:
+        log.exception('Open Library response error: %s', e)
+        raise
+
 
 
 def blocked(book: dict[str,str]) -> bool:
