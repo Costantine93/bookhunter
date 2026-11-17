@@ -68,29 +68,62 @@ def get_profile():
 def exclusions(kind='genre'):
     with db() as con: return [r['value'] for r in con.execute('SELECT value FROM exclusions WHERE kind=? ORDER BY value',(kind,))]
 
-def search_books(query: str, limit=8) -> list[dict[str,str]]:
-    params={'q':query,'maxResults':limit,'printType':'books','langRestrict':'it'}
-    r=requests.get(
-    'https://www.googleapis.com/books/v1/volumes',
-    params=params,
-    timeout=20
-)
-if not r.ok:
-    logging.error(
-        'Google Books HTTP %s: %s',
-        r.status_code,
-        r.text[:1000]
+
+def search_books(query: str, limit=8) -> list[dict[str, str]]:
+    params = {
+        'q': query,
+        'maxResults': limit,
+        'printType': 'books',
+        'langRestrict': 'it'
+    }
+
+    r = requests.get(
+        'https://www.googleapis.com/books/v1/volumes',
+        params=params,
+        timeout=20
     )
-    r.raise_for_status()
-    out=[]
-    for item in r.json().get('items',[]):
-        v=item.get('volumeInfo',{}); ids=v.get('industryIdentifiers',[])
-        isbn=next((x.get('identifier','') for x in ids if x.get('type') in ('ISBN_13','ISBN_10')),'')
-        out.append({'title':v.get('title','Titolo non disponibile'),'authors':', '.join(v.get('authors',[])),
-          'publisher':v.get('publisher',''),'published':v.get('publishedDate',''),
-          'description':re.sub(r'<[^>]+>',' ',v.get('description',''))[:1200],
-          'categories':', '.join(v.get('categories',[])),'isbn':isbn,'link':v.get('infoLink',''),'source':'Google Books'})
+
+    if not r.ok:
+        logging.error(
+            'Google Books HTTP %s: %s',
+            r.status_code,
+            r.text[:1000]
+        )
+        r.raise_for_status()
+
+    out = []
+
+    for item in r.json().get('items', []):
+        v = item.get('volumeInfo', {})
+        ids = v.get('industryIdentifiers', [])
+
+        isbn = next(
+            (
+                x.get('identifier', '')
+                for x in ids
+                if x.get('type') in ('ISBN_13', 'ISBN_10')
+            ),
+            ''
+        )
+
+        out.append({
+            'title': v.get('title', 'Titolo non disponibile'),
+            'authors': ', '.join(v.get('authors', [])),
+            'publisher': v.get('publisher', ''),
+            'published': v.get('publishedDate', ''),
+            'description': re.sub(
+                r'<[^>]+>',
+                ' ',
+                v.get('description', '')
+            )[:1200],
+            'categories': ', '.join(v.get('categories', [])),
+            'isbn': isbn,
+            'link': v.get('infoLink', ''),
+            'source': 'Google Books'
+        })
+
     return out
+
 
 def blocked(book: dict[str,str]) -> bool:
     cats=(book.get('categories','')+' '+book.get('description','')).casefold()
