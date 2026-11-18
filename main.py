@@ -5,6 +5,7 @@ from zoneinfo import ZoneInfo
 from typing import Any
 import requests
 import feedparser
+import time
 from dotenv import load_dotenv
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, CallbackQueryHandler, ContextTypes
@@ -149,15 +150,24 @@ def search_books(query: str, limit=8) -> list[dict[str, str]]:
     else:
         params['q'] = raw_query
 
-    try:
-        r = requests.get(
-            'https://openlibrary.org/search.json',
-            params=params,
-            headers={
-                'User-Agent': 'BookHunterTelegramBot/1.0'
-            },
-            timeout=20
-        )
+    
+            for attempt in range(3):
+                try:
+                    r = requests.get(
+                        'https://openlibrary.org/search.json',
+                        params=params,
+                        headers={
+                            'User-Agent': 'BookHunterTelegramBot/1.0'
+                        },
+                        timeout=(10, 30)
+                    )
+                    break
+
+                except requests.exceptions.RequestException:
+                    if attempt == 2:
+                        raise
+                    time.sleep(2)
+
 
         if not r.ok:
             log.error(
