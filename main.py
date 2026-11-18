@@ -219,13 +219,32 @@ def search_books(query: str, limit=8) -> list[dict[str, str]]:
 
 
 
-def blocked(book: dict[str,str]) -> bool:
-    cats=(book.get('categories','')+' '+book.get('description','')).casefold()
+def blocked(book: dict[str, str]) -> bool:
+    cats = (
+        (book.get('categories', '') or '') + ' ' +
+        (book.get('description', '') or '')
+    ).casefold()
+
+    genre_terms = {
+        'romance': ['romance', 'romantic'],
+        'young adult': ['young adult', 'teen', 'adolescent'],
+        'letteratura erotica': ['erotica', 'erotic', 'erotism'],
+        'poesia': ['poetry', 'poesia', 'poems']
+    }
+
     for genre in exclusions('genre'):
-        terms={'romance':['romance','romantic'],'young adult':['young adult','teen','adolescent'],'letteratura erotica':['erotico','erotica','erotic'],'poesia':['poesia','poetry']}.get(genre.casefold(),[genre.casefold()])
-        if any(t in cats for t in terms): return True
-    author=book.get('authors','').casefold()
-    return any(x.casefold() in author for x in exclusions('author'))
+        genre = genre.casefold().strip()
+        terms = genre_terms.get(genre, [genre])
+
+        if any(term in cats for term in terms):
+            return True
+
+    author = (book.get('authors', '') or '').casefold()
+
+    return any(
+        name.casefold() in author
+        for name in exclusions('author')
+    )
 
 def save_book(b,status='wishlist',rating=None):
     with db() as con:
