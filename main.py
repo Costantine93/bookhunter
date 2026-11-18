@@ -19,13 +19,13 @@ DB_PATH = os.getenv('DATABASE_PATH', '/data/bookhunter.sqlite3')
 TIMEZONE = os.getenv('TIMEZONE', 'Europe/Rome')
 RSS_FEEDS = [x.strip() for x in os.getenv('BOOK_RSS_FEEDS', '').split(',') if x.strip()]
 PUBLISHERS = ['Adelphi','Einaudi','Sellerio','Feltrinelli','Mondadori','Neri Pozza','Iperborea','Fazi']
-EXCLUDED_GENRES = ['Romance','Young Adult','Letteratura erotica','Poesia']
+EXCLUDED_GENRES = []
 DEFAULT_PROFILE = '''Profilo letterario BookHunter (italiano):
 Autori apprezzati: John Steinbeck, Philip Roth, Han Kang, Stephen King, Donato Carrisi, Niccolò Ammaniti, Emmanuel Carrère.
 Preferenze: romanzi autoconclusivi; narrativa letteraria e psicologica; autobiografia e autofiction; critica sociale; thriller, noir e horror.
 Fantascienza: desidera riscoprirla, privilegiando romanzi autoconclusivi e non saghe lunghe.
 Editori da monitorare: Adelphi, Einaudi, Sellerio, Feltrinelli, Mondadori, Neri Pozza, Iperborea, Fazi.
-Generi esclusi: Romance, Young Adult, Letteratura erotica, Poesia.
+Nessuna esclusione automatica per genere o autore.
 Preferisce recensioni ragionate e suggerimenti motivati. Lingua: italiano, preferire edizioni italiane.
 '''
 
@@ -50,7 +50,7 @@ def init_db():
     with db() as con:
         con.executescript(SCHEMA)
         con.execute('INSERT OR IGNORE INTO profile(key,value) VALUES(?,?)', ('taste', DEFAULT_PROFILE))
-        for g in EXCLUDED_GENRES: con.execute('INSERT OR IGNORE INTO exclusions(kind,value) VALUES(?,?)', ('genre',g))
+        con.execute("DELETE FROM exclusions WHERE kind IN ('genre','author')")
 
 def allowed(update: Update) -> bool:
     uid=update.effective_user.id if update.effective_user else None
@@ -64,7 +64,10 @@ async def guard(update: Update) -> bool:
 def get_profile():
     with db() as con:
         row=con.execute("SELECT value FROM profile WHERE key='taste'").fetchone()
-        return row['value'] if row else DEFAULT_PROFILE
+        profile = row['value'] if row else DEFAULT_PROFILE
+    # Elimina dal vecchio profilo la riga di esclusioni predefinite, se presente.
+    profile = '\n'.join(line for line in profile.splitlines() if not line.strip().casefold().startswith('generi esclusi:'))
+    return profile
 
 def exclusions(kind='genre'):
     with db() as con: return [r['value'] for r in con.execute('SELECT value FROM exclusions WHERE kind=? ORDER BY value',(kind,))]
@@ -73,20 +76,19 @@ def exclusions(kind='genre'):
 
 
 def search_books(query: str, limit=8) -> list[dict[str, str]]:
-    """Ricerca libri per titolo, autore o testo libero."""
+    """Cerca opere disponibili in italiano su Open Library.
 
+    La ricerca include sia opere di autori italiani sia opere tradotte:
+    il filtro riguarda la lingua dell'edizione/catalogazione (ita), non
+    la nazionalità dell'autore.
+    """
     raw_query = query.strip()
     if not raw_query:
         return []
 
     known_authors = [
-        'Emmanuel Carrère',
-        'John Steinbeck',
-        'Philip Roth',
-        'Han Kang',
-        'Stephen King',
-        'Donato Carrisi',
-        'Niccolò Ammaniti'
+        'Emmanuel Carrère', 'John Steinbeck', 'Philip Roth', 'Han Kang',
+        'Stephen King', 'Donato Carrisi', 'Niccolò Ammaniti'
     ]
 
     title = ''
@@ -94,137 +96,122 @@ def search_books(query: str, limit=8) -> list[dict[str, str]]:
 
     title_match = re.search(
         r'(?:^|\s)(?:titolo|title)\s*:\s*(.+?)(?=\s+(?:autore|author)\s*:|$)',
-        raw_query,
-        flags=re.IGNORECASE
+        raw_query, flags=re.IGNORECASE
     )
-
     author_match = re.search(
         r'(?:^|\s)(?:autore|author)\s*:\s*(.+?)(?=\s+(?:titolo|title)\s*:|$)',
-        raw_query,
-        flags=re.IGNORECASE
+        raw_query, flags=re.IGNORECASE
     )
 
     if title_match:
         title = title_match.group(1).strip().strip('"')
-
     if author_match:
         author = author_match.group(1).strip().strip('"')
 
     if not title and not author:
         folded = raw_query.casefold()
-
         for candidate in sorted(known_authors, key=len, reverse=True):
             pos = folded.rfind(candidate.casefold())
-
             if pos >= 0:
                 before = raw_query[:pos].strip()
                 after = raw_query[pos + len(candidate):].strip()
-
                 if not after:
-                    title = before
-                    author = candidate
+                    title, author = before, candidate
                     break
-
                 if not before:
-                    author = candidate
-                    title = after
+                    author, title = candidate, after
                     break
 
-    params = {
-        'limit': min(max(int(limit), 1), 20),
-        'fields': (
-            'key,title,author_name,first_publish_year,'
-            'publisher,subject,isbn,cover_i,first_sentence'
-        )
-    }
+    # Open Library usa codici ISO 639-2/B: ita = italiano.
+    # La clausola language:ita vale anche per autori stranieri tradotti.
+    query_parts = []
+    if title:
+        query_parts.append(f'title:"{title}"')
+    if author:
+        query_parts.append(f'author:"{author}"')
+    if not title and not author:
+        query_parts.append(raw_query)
+    query_parts.append('language:ita')
 
-    if title and author:
-        params.update({
-            'title': title,
-            'author': author
-        })
-    elif author:
-        params['author'] = author
-    elif title:
-        params['title'] = title
-    else:
-        params['q'] = raw_query
+    base_query = ' '.join(query_parts[:-1])
+    fields = (
+        'key,title,author_name,first_publish_year,'
+        'publisher,subject,isbn,cover_i,first_sentence,language'
+    )
 
-    try:
+    def fetch(query_text):
+        params = {
+            'q': query_text,
+            'limit': min(max(int(limit), 1), 20),
+            'fields': fields
+        }
+        last_error = None
         for attempt in range(3):
             try:
-                r = requests.get(
+                response = requests.get(
                     'https://openlibrary.org/search.json',
                     params=params,
-                    headers={
-                        'User-Agent': 'BookHunterTelegramBot/1.0'
-                    },
+                    headers={'User-Agent': 'BookHunterTelegramBot/1.0 (book search)'},
                     timeout=(10, 30)
                 )
-                break
+                response.raise_for_status()
+                return response.json()
+            except (requests.exceptions.RequestException, ValueError) as exc:
+                last_error = exc
+                log.warning(
+                    'Open Library tentativo %s/3 non riuscito: %s',
+                    attempt + 1, exc
+                )
+                if attempt < 2:
+                    time.sleep(1.5 * (attempt + 1))
+        log.error('Ricerca Open Library fallita dopo 3 tentativi')
+        raise last_error
 
-            except requests.exceptions.RequestException:
-                if attempt == 2:
-                    raise
-                time.sleep(2)
+    # Prima cerchiamo le edizioni catalogate in italiano.
+    data = fetch(base_query + ' language:ita')
+    docs = data.get('docs', [])
+    verified_keys = {
+        item.get('key') for item in docs
+        if 'ita' in (item.get('language') or [])
+    }
 
-        if not r.ok:
-            log.error(
-                'Open Library HTTP %s: %s',
-                r.status_code,
-                r.text[:1000]
-            )
+    # Completiamo con risultati non filtrati per lingua, così da non perdere
+    # opere che potrebbero avere un'edizione italiana non catalogata. Questi
+    # risultati vengono marcati come non verificati e ordinati in fondo.
+    if len(docs) < min(max(int(limit), 1), 20):
+        fallback = fetch(base_query).get('docs', [])
+        known_keys = {item.get('key') for item in docs}
+        docs.extend(item for item in fallback if item.get('key') not in known_keys)
 
-        r.raise_for_status()
+    results = []
+    for item in docs:
+        languages = item.get('language') or []
+        italian_verified = ('ita' in languages) or (item.get('key') in verified_keys)
 
-        data = r.json()
-        out = []
+        sentences = item.get('first_sentence') or []
+        if isinstance(sentences, list):
+            description = ' '.join(str(s) for s in sentences)
+        elif isinstance(sentences, str):
+            description = sentences
+        else:
+            description = ''
 
-        for item in data.get('docs', []):
-            title_value = item.get('title') or 'Titolo non disponibile'
+        key = item.get('key', '')
+        results.append({
+            'title': item.get('title') or 'Titolo non disponibile',
+            'authors': ', '.join(item.get('author_name') or []),
+            'publisher': ', '.join((item.get('publisher') or [])[:3]),
+            'published': str(item.get('first_publish_year', '')),
+            'description': description[:1200],
+            'categories': ', '.join((item.get('subject') or [])[:10]),
+            'isbn': next(iter(item.get('isbn') or []), ''),
+            'link': 'https://openlibrary.org' + key if key else '',
+            'source': 'Open Library',
+            'italian_verified': italian_verified
+        })
 
-            authors = ', '.join(item.get('author_name') or [])
-            publishers = ', '.join((item.get('publisher') or [])[:3])
-            subjects = ', '.join((item.get('subject') or [])[:10])
-
-            isbn = next(iter(item.get('isbn') or []), '')
-
-            sentences = item.get('first_sentence', [])
-
-            if isinstance(sentences, list):
-                description = ' '.join(str(s) for s in sentences)
-            elif isinstance(sentences, str):
-                description = sentences
-            else:
-                description = ''
-
-            key = item.get('key', '')
-            link = (
-                'https://openlibrary.org' + key
-                if key else ''
-            )
-
-            out.append({
-                'title': title_value,
-                'authors': authors,
-                'publisher': publishers,
-                'published': str(item.get('first_publish_year', '')),
-                'description': description[:1200],
-                'categories': subjects,
-                'isbn': isbn,
-                'link': link,
-                'source': 'Open Library'
-            })
-
-        return out
-
-    except requests.exceptions.RequestException as e:
-        log.exception('Open Library search failed: %s', e)
-        raise
-
-    except (ValueError, TypeError, KeyError) as e:
-        log.exception('Open Library response error: %s', e)
-        raise
+    results.sort(key=lambda book: not book.get('italian_verified', False))
+    return results
 
 
 
@@ -240,15 +227,22 @@ def save_book(b,status='wishlist',rating=None):
 def find_saved(title):
     with db() as con: return con.execute('SELECT * FROM books WHERE title LIKE ? ORDER BY id DESC LIMIT 1',(f'%{title}%',)).fetchone()
 
-def fmt(b,n=None):
-    p=f"{n}. " if n else ''
-    lines=[f"📚 *{p}{b.get('title','Titolo non disponibile')}*"]
-    if b.get('authors'): lines.append('Autore: '+b['authors'])
-    if b.get('publisher'): lines.append('Editore: '+b['publisher'])
-    if b.get('published'): lines.append('Pubblicazione: '+b['published'])
-    if b.get('categories'): lines.append('Categorie: '+b['categories'])
-    if b.get('link'): lines.append('[Scheda libro]('+b['link']+')')
+def fmt(b, n=None):
+    prefix = f"{n}. " if n else ""
+    lines = [f"📚 {prefix}{b.get('title', 'Titolo non disponibile')}"]
+    if b.get('authors'):
+        lines.append('Autore: ' + b['authors'])
+    if b.get('publisher'):
+        lines.append('Editore: ' + b['publisher'])
+    if b.get('published'):
+        lines.append('Pubblicazione: ' + b['published'])
+    if b.get('categories'):
+        lines.append('Categorie: ' + b['categories'])
+    if b.get('link'):
+        lines.append('Scheda libro: ' + b['link'])
+    lines.append('Lingua italiana: verificata' if b.get('italian_verified') else 'Lingua italiana: non verificata')
     return '\n'.join(lines)
+
 
 def book_keyboard(b):
     # Callback data stores the exact title; IDs are stable database IDs after saving.
@@ -262,23 +256,23 @@ async def start(update:Update, context:ContextTypes.DEFAULT_TYPE):
     if not await guard(update): return
     await update.message.reply_text('📚 Benvenuto in BookHunter!\n\nSono il tuo libraio personale. Usa i pulsanti qui sotto o /aiutami per i comandi.',reply_markup=InlineKeyboardMarkup([
       [InlineKeyboardButton('✨ Consigliami libri',callback_data='menu:recommend'),InlineKeyboardButton('🔎 Cerca libri',callback_data='menu:search')],
-      [InlineKeyboardButton('📚 La mia libreria',callback_data='menu:library'),InlineKeyboardButton('🚫 Generi esclusi',callback_data='menu:genres')],
-      [InlineKeyboardButton('🆕 Nuove uscite',callback_data='menu:releases'),InlineKeyboardButton('👤 Il mio profilo',callback_data='menu:profile')]]))
+      [InlineKeyboardButton('📚 La mia libreria',callback_data='menu:library'),InlineKeyboardButton('👤 Il mio profilo',callback_data='menu:profile')],
+      [InlineKeyboardButton('🆕 Nuove uscite',callback_data='menu:releases')]]))
 
 async def help_cmd(update:Update,context:ContextTypes.DEFAULT_TYPE):
     if not await guard(update): return
-    await update.message.reply_text('/cerca <titolo, autore o tema>\n/consiglio [tema]\n/wishlist <titolo>\n/lettura <titolo>\n/letto <titolo> | <voto 1-5>\n/sospeso <titolo>\n/nonleggere <titolo>\n/escludigenere <genere>\n/includigenere <genere>\n/escludiautore <autore>\n/libreria [desidero|lettura|letti|sospesi|esclusi]\n/profilo\n/nuoveuscite')
+    await update.message.reply_text('/cerca <titolo, autore o tema>\n/consiglio [tema]\n/wishlist <titolo>\n/lettura <titolo>\n/letto <titolo> | <voto 1-5>\n/sospeso <titolo>\n/nonleggere <titolo>\n/libreria [desidero|lettura|letti|sospesi|esclusi]\n/profilo\n/nuoveuscite')
 
 async def search_cmd(update:Update,context:ContextTypes.DEFAULT_TYPE):
     if not await guard(update): return
     q=' '.join(context.args).strip()
-    if not q: return await update.message.reply_text('Esempio: /cerca thriller psicologico italiano')
+    if not q: return await update.message.reply_text('Esempio: /cerca thriller psicologico. Mostro edizioni in italiano, anche di autori stranieri tradotti.')
     try:
-        books=[b for b in search_books(q,10) if not blocked(b)]
-        if not books: return await update.message.reply_text('Nessun risultato compatibile con i filtri attuali. Puoi modificare le esclusioni con /includigenere.')
+        books=search_books(q,10)
+        if not books: return await update.message.reply_text('Nessun risultato trovato nel catalogo. Prova un titolo, autore o argomento più specifico.')
         for i,b in enumerate(books[:6],1):
             save_book(b,'discovered')
-            await update.message.reply_text(fmt(b,i),parse_mode='Markdown',reply_markup=book_keyboard(b),disable_web_page_preview=True)
+            await update.message.reply_text(fmt(b,i), reply_markup=book_keyboard(b), disable_web_page_preview=True)
     except Exception as e:
         log.exception('search failed'); await update.message.reply_text(f'Ricerca non disponibile ({type(e).__name__}).')
 
@@ -287,20 +281,20 @@ async def recommendation_cmd(update:Update,context:ContextTypes.DEFAULT_TYPE):
     topic=' '.join(context.args).strip() or 'romanzi autoconclusivi di narrativa letteraria, autobiografia, critica sociale, thriller e fantascienza autoconclusiva'
     query=topic+' (John Steinbeck OR Philip Roth OR Han Kang OR Stephen King OR Donato Carrisi OR Emmanuel Carrere)'
     try:
-        books=[b for b in search_books(query,20) if not blocked(b)]
+        books=search_books(query,20)
         if not books: return await update.message.reply_text('Non ho trovato risultati compatibili. Prova un tema più specifico.')
         for b in books[:10]: save_book(b,'discovered')
         if OPENAI_API_KEY:
             from openai import OpenAI
             client=OpenAI(api_key=OPENAI_API_KEY)
             compact='\n'.join(f"{b['title']} | {b['authors']} | {b['publisher']} | {b['published']} | {b['description'][:500]}" for b in books[:12])
-            prompt=f"Sei BookHunter, libraio personale in italiano. Non inventare informazioni. Profilo: {get_profile()}\nEsclusioni obbligatorie: {', '.join(exclusions())}.\nLibri da non riproporre: {saved_titles()}\nRichiesta: {topic}\nCatalogo verificato:\n{compact}\nSeleziona massimo 5 libri, motiva in base ai gusti, segnala quando i dati non bastano e non proporre saghe se non è chiaro che siano autoconclusive."
+            prompt=f"Sei BookHunter, libraio personale in italiano. Non inventare informazioni. Profilo: {get_profile()}\nNon applicare esclusioni automatiche di genere o autore.\nLibri da non riproporre: {saved_titles()}\nRichiesta: {topic}\nCatalogo verificato:\n{compact}\nSeleziona massimo 5 libri, motiva in base ai gusti, segnala quando i dati non bastano e non proporre saghe se non è chiaro che siano autoconclusive."
             answer=client.responses.create(model=OPENAI_MODEL,input=prompt).output_text
             await update.message.reply_text(answer[:3900])
         else:
             await update.message.reply_text('Ecco una prima selezione catalografica. Per le motivazioni AI va aggiunta la chiave OpenAI nelle variabili private del server.')
         for i,b in enumerate(books[:5],1):
-            await update.message.reply_text(fmt(b,i),parse_mode='Markdown',reply_markup=book_keyboard(b),disable_web_page_preview=True)
+            await update.message.reply_text(fmt(b,i), reply_markup=book_keyboard(b), disable_web_page_preview=True)
     except Exception as e:
         log.exception('recommendation failed'); await update.message.reply_text(f'Consigli non disponibili ({type(e).__name__}).')
 
@@ -341,7 +335,6 @@ async def callback(update:Update,context:ContextTypes.DEFAULT_TYPE):
     elif data=='menu:recommend': await q.message.reply_text('Scrivi /consiglio oppure /consiglio fantascienza autoconclusiva')
     elif data=='menu:search': await q.message.reply_text('Scrivi /cerca seguito da autore, titolo o argomento.')
     elif data=='menu:library': await show_library(q.message)
-    elif data=='menu:genres': await q.message.reply_text('Generi attualmente esclusi: '+(', '.join(exclusions()) or 'nessuno')+'\nPer aggiungere: /escludigenere genere\nPer rimuovere: /includigenere genere')
     elif data=='menu:releases': await releases_cmd_from_message(q.message)
     elif data=='menu:profile': await q.message.reply_text(get_profile()[:3900])
 
@@ -360,21 +353,9 @@ async def library_cmd(update,context):
     key=' '.join(context.args).strip().casefold(); mapping={'desidero':'wishlist','lettura':'reading','letti':'read','sospesi':'suspended','esclusi':'esclusi'}
     await show_library(update.message,mapping.get(key))
 
-async def exclusion_cmd(update,context,kind,action):
-    if not await guard(update): return
-    value=' '.join(context.args).strip()
-    if not value: return await update.message.reply_text('Indica il genere o autore. Esempio: /escludigenere fantasy')
-    with db() as con:
-        if action=='add': con.execute('INSERT OR IGNORE INTO exclusions(kind,value) VALUES(?,?)',(kind,value))
-        else: con.execute('DELETE FROM exclusions WHERE kind=? AND lower(value)=lower(?)',(kind,value))
-    await update.message.reply_text(('Esclusione aggiunta: ' if action=='add' else 'Esclusione rimossa: ')+value)
-async def exclude_genre(u,c): await exclusion_cmd(u,c,'genre','add')
-async def include_genre(u,c): await exclusion_cmd(u,c,'genre','remove')
-async def exclude_author(u,c): await exclusion_cmd(u,c,'author','add')
-
 async def profile_cmd(update,context):
     if not await guard(update): return
-    await update.message.reply_text(get_profile()+'\nGeneri esclusi: '+(', '.join(exclusions()) or 'nessuno'))
+    await update.message.reply_text(get_profile()+'\n\nNessuna esclusione automatica per genere o autore.')
 
 async def releases_cmd_from_message(message):
     if not RSS_FEEDS: return await message.reply_text('Le fonti RSS editoriali non sono ancora configurate. Non mostro uscite non verificate.')
@@ -403,6 +384,13 @@ async def post_init(app:Application):
     app.job_queue.run_daily(weekly_digest,time=datetime.now(ZoneInfo(TIMEZONE)).replace(hour=10,minute=0,second=0,microsecond=0).timetz(),days=(6,),name='weekly-digest')
 
 def main():
+    if not TOKEN: raise SystemExit('Configura TELEGRAM_BOT_TOKEN')
+    if ALLOWED_ID==0: log.warning('ALLOWED_TELEGRAM_USER_ID non impostato: bot non limitato a un solo utente')
+    init_db(); app=Application.builder().token(TOKEN).post_init(post_init).build()
+    handlers=[CommandHandler('start',start),CommandHandler(['aiutami','help'],help_cmd),CommandHandler('cerca',search_cmd),CommandHandler('consiglio',recommendation_cmd),CommandHandler('wishlist',wishlist_cmd),CommandHandler('lettura',reading_cmd),CommandHandler('letto',read_cmd),CommandHandler('sospeso',suspended_cmd),CommandHandler('nonleggere',rejected_cmd),CommandHandler('libreria',library_cmd),CommandHandler('profilo',profile_cmd),CommandHandler('nuoveuscite',releases_cmd),CallbackQueryHandler(callback)]
+    for h in handlers: app.add_handler(h)
+    log.info('BookHunter avviato'); app.run_polling(allowed_updates=Update.ALL_TYPES)
+if __name__=='__main__': main()
     if not TOKEN: raise SystemExit('Configura TELEGRAM_BOT_TOKEN')
     if ALLOWED_ID==0: log.warning('ALLOWED_TELEGRAM_USER_ID non impostato: bot non limitato a un solo utente')
     init_db(); app=Application.builder().token(TOKEN).post_init(post_init).build()
