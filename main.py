@@ -6,6 +6,8 @@ from typing import Any
 import requests
 import feedparser
 import time
+from html.parser import HTMLParser
+from urllib.parse import urljoin
 from dotenv import load_dotenv
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, CallbackQueryHandler, ContextTypes
@@ -13,8 +15,6 @@ from telegram.ext import Application, CommandHandler, CallbackQueryHandler, Cont
 load_dotenv()
 TOKEN = os.getenv('TELEGRAM_BOT_TOKEN', '')
 ALLOWED_ID = int(os.getenv('ALLOWED_TELEGRAM_USER_ID', '0') or 0)
-OPENAI_API_KEY = os.getenv('OPENAI_API_KEY', '')
-OPENAI_MODEL = os.getenv('OPENAI_MODEL', 'gpt-5.1')
 DB_PATH = os.getenv('DATABASE_PATH', '/data/bookhunter.sqlite3')
 TIMEZONE = os.getenv('TIMEZONE', 'Europe/Rome')
 RSS_FEEDS = [x.strip() for x in os.getenv('BOOK_RSS_FEEDS', '').split(',') if x.strip()]
@@ -234,7 +234,7 @@ def blocked(book: dict[str, str]) -> bool:
 def save_book(b,status='wishlist',rating=None):
     with db() as con:
         con.execute('''INSERT INTO books(title,authors,publisher,published,description,categories,isbn,link,source,status,rating,added_at)
-        VALUES(?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(title,authors) DO UPDATE SET status=excluded.status, rating=COALESCE(excluded.rating,books.rating)''',
+        VALUES(?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(title,authors) DO UPDATE SET status=CASE WHEN books.status='discovered' THEN excluded.status ELSE books.status END, rating=COALESCE(excluded.rating,books.rating)''',
         (b.get('title',''),b.get('authors',''),b.get('publisher',''),b.get('published',''),b.get('description',''),b.get('categories',''),b.get('isbn',''),b.get('link',''),b.get('source','manual'),status,rating,datetime.now(timezone.utc).isoformat()))
 
 def find_saved(title):
@@ -267,9 +267,10 @@ def book_keyboard(b):
 
 async def start(update:Update, context:ContextTypes.DEFAULT_TYPE):
     if not await guard(update): return
-    await update.message.reply_text('📚 Benvenuto in BookHunter!\n\nSono il tuo libraio personale. Usa i pulsanti qui sotto o /aiutami per i comandi.',reply_markup=InlineKeyboardMarkup([
+    await update.message.reply_text('📚 Benvenuto in BookHunter!\n\nIl tuo libraio personale: cerca libri, gestisci i tuoi scaffali, ricevi consigli AI basati sulle tue letture e scopri le novità editoriali.',reply_markup=InlineKeyboardMarkup([
       [InlineKeyboardButton('✨ Consigliami libri',callback_data='menu:recommend'),InlineKeyboardButton('🔎 Cerca libri',callback_data='menu:search')],
-      [InlineKeyboardButton('📚 La mia libreria',callback_data='menu:library'),InlineKeyboardButton('👤 Il mio profilo',callback_data='menu:profile')],
+      [InlineKeyboardButton('❤️ Desidero leggere',callback_data='menu:wishlist'),InlineKeyboardButton('✅ Libri letti',callback_data='menu:library')],
+      [InlineKeyboardButton('📖 In lettura',callback_data='menu:reading'),InlineKeyboardButton('👤 Il mio profilo',callback_data='menu:profile')],
       [InlineKeyboardButton('🆕 Nuove uscite',callback_data='menu:releases')]]))
 
 async def help_cmd(update:Update,context:ContextTypes.DEFAULT_TYPE):
@@ -290,26 +291,78 @@ async def search_cmd(update:Update,context:ContextTypes.DEFAULT_TYPE):
         log.exception('search failed'); await update.message.reply_text(f'Ricerca non disponibile ({type(e).__name__}).')
 
 async def recommendation_cmd(update:Update,context:ContextTypes.DEFAULT_TYPE):
+    """Consigli personalizzati senza servizi AI a pagamento: ranking locale + Open Library."""
     if not await guard(update): return
-    topic=' '.join(context.args).strip() or 'romanzi autoconclusivi di narrativa letteraria, autobiografia, critica sociale, thriller e fantascienza autoconclusiva'
-    query=topic+' (John Steinbeck OR Philip Roth OR Han Kang OR Stephen King OR Donato Carrisi OR Emmanuel Carrere)'
+    message=update.effective_message
+    topic=' '.join(context.args).strip()
+    with db() as con:
+        read_rows=con.execute("SELECT title,authors,publisher,categories,rating FROM books WHERE status='read' ORDER BY id DESC LIMIT 40").fetchall()
+        wish_rows=con.execute("SELECT title,authors,publisher,categories FROM books WHERE status='wishlist' ORDER BY id DESC LIMIT 40").fetchall()
+        reading_rows=con.execute("SELECT title,authors FROM books WHERE status='reading' ORDER BY id DESC LIMIT 20").fetchall()
+        rejected_rows=con.execute("SELECT title,authors FROM books WHERE status='rejected' ORDER BY id DESC LIMIT 60").fetchall()
+        known_rows=con.execute("SELECT title,authors FROM books WHERE status IN ('read','wishlist','reading','rejected')").fetchall()
+
+    def norm(value):
+        return re.sub(r'[^a-z0-9àèéìòù]+',' ',(value or '').casefold()).strip()
+    known={norm(r['title']) for r in known_rows}
+    known_authors={norm(r['authors']) for r in known_rows if r['authors']}
+    # I voti alti pesano di più; i libri desiderati contribuiscono come interessi, non come letture concluse.
+    liked_authors=[]
+    for r in read_rows:
+        if r['authors'] and (r['rating'] is None or r['rating']>=4):
+            liked_authors.extend(a.strip() for a in r['authors'].split(',') if a.strip())
+    liked_authors += [r['authors'] for r in wish_rows if r['authors']]
+    author_queries=[]
+    for author in liked_authors:
+        if author and author not in author_queries: author_queries.append(author)
+    # Un tema digitato dall'utente è una ricerca aggiuntiva, non sostituisce la storia personale.
+    queries=[]
+    if topic: queries.append(topic)
+    queries.extend(f'author:"{a}"' for a in author_queries[:5])
+    if not queries:
+        queries=['literary fiction Italian translation','psychological fiction Italian','autobiography Italian']
+    candidates=[]; seen=set()
     try:
-        books=search_books(query,20)
-        if not books: return await update.message.reply_text('Non ho trovato risultati compatibili. Prova un tema più specifico.')
-        for b in books[:10]: save_book(b,'discovered')
-        if OPENAI_API_KEY:
-            from openai import OpenAI
-            client=OpenAI(api_key=OPENAI_API_KEY)
-            compact='\n'.join(f"{b['title']} | {b['authors']} | {b['publisher']} | {b['published']} | {b['description'][:500]}" for b in books[:12])
-            prompt=f"Sei BookHunter, libraio personale in italiano. Non inventare informazioni. Profilo: {get_profile()}\nNon applicare esclusioni automatiche di genere o autore.\nLibri da non riproporre: {saved_titles()}\nRichiesta: {topic}\nCatalogo verificato:\n{compact}\nSeleziona massimo 5 libri, motiva in base ai gusti, segnala quando i dati non bastano e non proporre saghe se non è chiaro che siano autoconclusive."
-            answer=client.responses.create(model=OPENAI_MODEL,input=prompt).output_text
-            await update.message.reply_text(answer[:3900])
-        else:
-            await update.message.reply_text('Ecco una prima selezione catalografica. Per le motivazioni AI va aggiunta la chiave OpenAI nelle variabili private del server.')
-        for i,b in enumerate(books[:5],1):
-            await update.message.reply_text(fmt(b,i), reply_markup=book_keyboard(b), disable_web_page_preview=True)
+        for query in queries[:6]:
+            for book in search_books(query,12):
+                title=norm(book.get('title'))
+                if not title or title in known or title in seen: continue
+                if not book.get('italian_verified'): continue
+                seen.add(title); candidates.append(book)
+        if not candidates:
+            return await message.reply_text('Non ho trovato nuovi titoli italiani abbastanza pertinenti. Prova una ricerca più specifica o registra qualche libro letto e i relativi voti.')
+
+        # Punteggio deterministico e trasparente: affinità autore/categorie e preferenze del profilo.
+        liked_author_tokens={norm(a) for a in author_queries}
+        liked_category_text=' '.join(norm(r['categories']) for r in read_rows if r['rating'] is None or r['rating']>=4)
+        wish_category_text=' '.join(norm(r['categories']) for r in wish_rows)
+        profile_text=norm(get_profile())
+        for book in candidates:
+            author=norm(book.get('authors'))
+            cats=norm(book.get('categories'))
+            score=0
+            if author and any(author==a or author in a or a in author for a in liked_author_tokens): score+=5
+            score+=sum(1 for token in set(cats.split()) if len(token)>4 and token in liked_category_text.split())
+            score+=sum(1 for token in set(cats.split()) if len(token)>4 and token in wish_category_text.split())
+            score+=sum(1 for token in ('narrativa','fiction','literary','psychological','thriller','autobiography','horror','fantasy') if token in cats or token in profile_text and token in cats)
+            if book.get('italian_verified'): score+=2
+            book['_score']=score
+        candidates.sort(key=lambda b:(-b['_score'], norm(b.get('title'))))
+        picks=candidates[:5]
+        intro='✨ **Consigli personalizzati – modalità gratuita**\nHo confrontato i tuoi scaffali con il catalogo Open Library. I suggerimenti sono selezionati con un sistema di affinità, senza API AI a pagamento.'
+        await message.reply_text(intro,parse_mode='Markdown')
+        for i,book in enumerate(picks,1):
+            # Salva il suggerimento prima di creare i pulsanti: così i callback
+            # puntano a un ID reale e non allo zero.
+            save_book(book, 'discovered')
+            reasons=[]
+            if any(norm(book.get('authors'))==norm(a) for a in author_queries): reasons.append('autore che hai già letto o inserito nei desideri')
+            if book.get('_score',0)>2: reasons.append('categorie affini ai tuoi interessi registrati')
+            if not reasons: reasons.append('corrispondenza con il profilo letterario e disponibilità di un’edizione italiana catalogata')
+            await message.reply_text(fmt(book,i)+'\n\nPerché te lo consiglio: '+', '.join(reasons)+'.',reply_markup=book_keyboard(book),disable_web_page_preview=True)
     except Exception as e:
-        log.exception('recommendation failed'); await update.message.reply_text(f'Consigli non disponibili ({type(e).__name__}).')
+        log.exception('free recommendation failed')
+        await message.reply_text(f'Consigli non disponibili in questo momento ({type(e).__name__}). Nessun servizio a pagamento è stato contattato; riprova quando il catalogo è raggiungibile.')
 
 def saved_titles():
     with db() as con: return '; '.join(r['title'] for r in con.execute("SELECT title FROM books WHERE status IN ('wishlist','reading','read','rejected')"))
@@ -345,22 +398,39 @@ async def callback(update:Update,context:ContextTypes.DEFAULT_TYPE):
             else: con.execute('UPDATE books SET status=? WHERE id=?',(status,int(bid)))
         await q.edit_message_reply_markup(reply_markup=None)
         await q.message.reply_text({'wishlist':'Aggiunto a ❤️ Desidero leggere.','reading':'Spostato in 📖 In lettura.','read':'Spostato in ✅ Letti.','rejected':'Ricevuto: non te lo proporrò più.'}[status])
-    elif data=='menu:recommend': await q.message.reply_text('Scrivi /consiglio oppure /consiglio fantascienza autoconclusiva')
+    elif data=='menu:recommend': await recommendation_cmd(update,context)
     elif data=='menu:search': await q.message.reply_text('Scrivi /cerca seguito da autore, titolo o argomento.')
-    elif data=='menu:library': await show_library(q.message)
+    elif data=='menu:library': await show_library(q.message, 'read')
+    elif data=='menu:wishlist': await show_library(q.message, 'wishlist')
+    elif data=='menu:reading': await show_library(q.message, 'reading')
     elif data=='menu:releases': await releases_cmd_from_message(q.message)
     elif data=='menu:profile': await q.message.reply_text(get_profile()[:3900])
 
 async def show_library(message, status=None):
     with db() as con:
-        if status=='esclusi': rows=con.execute("SELECT title,authors,status,rating FROM books WHERE status='rejected' ORDER BY id DESC LIMIT 30").fetchall()
-        elif status: rows=con.execute('SELECT title,authors,status,rating FROM books WHERE status=? ORDER BY id DESC LIMIT 30',(status,)).fetchall()
-        else: rows=con.execute('SELECT title,authors,status,rating FROM books ORDER BY id DESC LIMIT 30').fetchall()
-    if not rows: return await message.reply_text('Questo scaffale è vuoto.')
-    labels={'wishlist':'❤️ Desidero leggere','reading':'📖 In lettura','read':'✅ Letti','suspended':'⏸ Sospesi','rejected':'🚫 Esclusi','discovered':'Scoperti'}
-    lines=['📚 *La tua libreria*']
-    for r in rows: lines.append(f"• {r['title']} — {r['authors']} | {labels.get(r['status'],r['status'])}"+(f" | {r['rating']}/5" if r['rating'] else ''))
-    await message.reply_text('\n'.join(lines),parse_mode='Markdown')
+        if status=='esclusi':
+            rows=con.execute("SELECT id,title,authors,status,rating FROM books WHERE status='rejected' ORDER BY id DESC LIMIT 30").fetchall()
+        elif status:
+            rows=con.execute('SELECT id,title,authors,status,rating FROM books WHERE status=? ORDER BY id DESC LIMIT 30',(status,)).fetchall()
+        else:
+            rows=con.execute('SELECT id,title,authors,status,rating FROM books ORDER BY id DESC LIMIT 30').fetchall()
+    labels={'wishlist':'❤️ Desidero leggere','reading':'📖 In lettura','read':'✅ Libri letti','suspended':'⏸ Sospesi','rejected':'🚫 Esclusi','discovered':'Scoperti'}
+    heading=labels.get(status, '📚 La tua libreria')
+    if not rows:
+        return await message.reply_text(f'{heading}\n\nQuesto scaffale è vuoto.')
+    await message.reply_text(f'{heading} — {len(rows)} libri')
+    for r in rows:
+        line=f"📚 {r['title']} — {r['authors']}"
+        if r['rating']:
+            line+=f" | {r['rating']}/5"
+        if status=='wishlist':
+            keyboard=InlineKeyboardMarkup([[InlineKeyboardButton('📖 In lettura',callback_data=f"s:{r['id']}:reading"),InlineKeyboardButton('✅ Letto',callback_data=f"s:{r['id']}:read")]])
+        elif status=='reading':
+            keyboard=InlineKeyboardMarkup([[InlineKeyboardButton('✅ Letto',callback_data=f"s:{r['id']}:read")]])
+        else:
+            keyboard=None
+        await message.reply_text(line,reply_markup=keyboard)
+
 async def library_cmd(update,context):
     if not await guard(update): return
     key=' '.join(context.args).strip().casefold(); mapping={'desidero':'wishlist','lettura':'reading','letti':'read','sospesi':'suspended','esclusi':'esclusi'}
@@ -370,18 +440,58 @@ async def profile_cmd(update,context):
     if not await guard(update): return
     await update.message.reply_text(get_profile()+'\n\nNessuna esclusione automatica per genere o autore.')
 
+class ReleaseLinkParser(HTMLParser):
+    """Raccoglie i link alle comunicazioni ufficiali sulle novità editoriali."""
+    def __init__(self):
+        super().__init__(); self.links=[]; self._href=None; self._text=[]
+    def handle_starttag(self, tag, attrs):
+        if tag.lower()=='a':
+            self._href=dict(attrs).get('href'); self._text=[]
+    def handle_data(self, data):
+        if self._href is not None: self._text.append(data)
+    def handle_endtag(self, tag):
+        if tag.lower()=='a' and self._href is not None:
+            title=' '.join(' '.join(self._text).split())
+            if title: self.links.append((title,self._href))
+            self._href=None; self._text=[]
+
 async def releases_cmd_from_message(message):
-    if not RSS_FEEDS: return await message.reply_text('Le fonti RSS editoriali non sono ancora configurate. Non mostro uscite non verificate.')
-    found=0
+    """Mostra avvisi ufficiali di novità in libreria; non confonde ristampe e prime uscite."""
+    items=[]
+    # Fonte ufficiale del distributore: le schede riportano finestre di arrivo e link ai lanci.
+    official_url='https://ml-portale-prod-cms.messaggerielibri.it/'
+    try:
+        response=requests.get(official_url,headers={'User-Agent':'BookHunter/1.0'},timeout=(10,25))
+        response.raise_for_status()
+        parser=ReleaseLinkParser(); parser.feed(response.text)
+        seen=set()
+        for title,href in parser.links:
+            low=title.casefold()
+            if ('novità in libreria' in low or 'fumetti novità' in low) and href:
+                link=urljoin(official_url,href)
+                if link not in seen:
+                    seen.add(link); items.append((title,link,'Messaggerie Libri'))
+            if len(items)>=8: break
+    except Exception as e:
+        log.warning('Messaggerie novita non raggiungibile: %s',e)
+    # Eventuali feed aggiuntivi configurati dall'utente su Railway.
     for url in RSS_FEEDS:
-        feed=feedparser.parse(url)
-        for entry in feed.entries[:10]:
-            title=entry.get('title','Senza titolo'); link=entry.get('link',''); published=entry.get('published',entry.get('updated','Data non indicata')); key=entry.get('id',link or title)
-            with db() as con:
-                cur=con.execute('INSERT OR IGNORE INTO seen_releases(id,title,link,published,source,first_seen) VALUES(?,?,?,?,?,?)',(key,title,link,published,feed.feed.get('title',url),datetime.now(timezone.utc).isoformat()))
-            if cur.rowcount:
-                found+=1; await message.reply_text(f'🆕 {title}\n{published}\n{link}',disable_web_page_preview=True)
-    if not found: await message.reply_text('Nessuna nuova voce nei feed configurati dall’ultimo controllo.')
+        try:
+            feed=feedparser.parse(url)
+            for entry in feed.entries[:5]:
+                title=entry.get('title','Senza titolo')
+                link=entry.get('link','')
+                if link and not any(existing[1]==link for existing in items):
+                    published=entry.get('published',entry.get('updated','Data non indicata'))
+                    items.append((f'{title} — {published}',link,feed.feed.get('title','Feed editoriale')))
+        except Exception as e:
+            log.warning('Feed novita non disponibile %s: %s',url,e)
+    if not items:
+        return await message.reply_text('Non riesco a raggiungere in questo momento le fonti editoriali. Riprova più tardi; non mostro titoli non verificati.')
+    await message.reply_text('🆕 **Nuovi arrivi e novità editoriali**\nFonte principale: Messaggerie Libri. Le schede distinguono le novità dalle ristampe.',parse_mode='Markdown')
+    for title,link,source in items[:10]:
+        await message.reply_text(f'📚 {title}\nFonte: {source}\n{link}',disable_web_page_preview=True)
+
 async def releases_cmd(update,context):
     if not await guard(update): return
     await releases_cmd_from_message(update.message)
