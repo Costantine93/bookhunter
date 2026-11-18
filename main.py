@@ -136,14 +136,16 @@ def search_books(query: str, limit=8) -> list[dict[str, str]]:
     base_query = ' '.join(query_parts[:-1])
     fields = (
         'key,title,author_name,first_publish_year,'
-        'publisher,subject,isbn,cover_i,first_sentence,language'
+        'publisher,subject,isbn,cover_i,first_sentence,language,'
+        'editions,editions.key,editions.title,editions.language'
     )
 
     def fetch(query_text):
         params = {
             'q': query_text,
             'limit': min(max(int(limit), 1), 20),
-            'fields': fields
+            'fields': fields,
+            'lang': 'it'
         }
         last_error = None
         for attempt in range(3):
@@ -170,10 +172,9 @@ def search_books(query: str, limit=8) -> list[dict[str, str]]:
     # Prima cerchiamo le edizioni catalogate in italiano.
     data = fetch(base_query + ' language:ita')
     docs = data.get('docs', [])
-    verified_keys = {
-        item.get('key') for item in docs
-        if 'ita' in (item.get('language') or [])
-    }
+    # Il campo language dell'opera può contenere lingue di edizioni diverse.
+    # Per verificare davvero l'italiano controlliamo la lingua della singola
+    # edizione restituita nel blocco editions.
 
     # Completiamo con risultati non filtrati per lingua, così da non perdere
     # opere che potrebbero avere un'edizione italiana non catalogata. Questi
@@ -185,8 +186,20 @@ def search_books(query: str, limit=8) -> list[dict[str, str]]:
 
     results = []
     for item in docs:
-        languages = item.get('language') or []
-        italian_verified = ('ita' in languages) or (item.get('key') in verified_keys)
+        edition_data = item.get('editions') or {}
+        edition_docs = edition_data.get('docs') or []
+        italian_editions = [
+            edition for edition in edition_docs
+            if 'ita' in (edition.get('language') or [])
+        ]
+        italian_verified = bool(italian_editions)
+
+        # Mostra il titolo della specifica edizione italiana, non il titolo
+        # generale dell'opera che spesso è nella lingua originale.
+        edition_title = next(
+            (edition.get('title') for edition in italian_editions if edition.get('title')),
+            ''
+        )
 
         sentences = item.get('first_sentence') or []
         if isinstance(sentences, list):
@@ -198,7 +211,7 @@ def search_books(query: str, limit=8) -> list[dict[str, str]]:
 
         key = item.get('key', '')
         results.append({
-            'title': item.get('title') or 'Titolo non disponibile',
+            'title': edition_title or item.get('title') or 'Titolo non disponibile',
             'authors': ', '.join(item.get('author_name') or []),
             'publisher': ', '.join((item.get('publisher') or [])[:3]),
             'published': str(item.get('first_publish_year', '')),
@@ -391,4 +404,3 @@ def main():
     for h in handlers: app.add_handler(h)
     log.info('BookHunter avviato'); app.run_polling(allowed_updates=Update.ALL_TYPES)
 if __name__=='__main__': main()
-    
