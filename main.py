@@ -150,7 +150,7 @@ def search_books(query: str, limit=8) -> list[dict[str, str]]:
     else:
         params['q'] = raw_query
 
-        try:
+    try:
         for attempt in range(3):
             try:
                 r = requests.get(
