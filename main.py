@@ -150,8 +150,8 @@ def search_books(query: str, limit=8) -> list[dict[str, str]]:
     else:
         params['q'] = raw_query
 
-    
-            for attempt in range(3):
+    try:
+         for attempt in range(3):
                 try:
                     r = requests.get(
                         'https://openlibrary.org/search.json',
