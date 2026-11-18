@@ -70,13 +70,84 @@ def exclusions(kind='genre'):
 
 
 
+
 def search_books(query: str, limit=8) -> list[dict[str, str]]:
+    """Ricerca libri per titolo, autore o testo libero."""
+
+    raw_query = query.strip()
+    if not raw_query:
+        return []
+
+    known_authors = [
+        'Emmanuel Carrère',
+        'John Steinbeck',
+        'Philip Roth',
+        'Han Kang',
+        'Stephen King',
+        'Donato Carrisi',
+        'Niccolò Ammaniti'
+    ]
+
+    title = ''
+    author = ''
+
+    title_match = re.search(
+        r'(?:^|\s)(?:titolo|title)\s*:\s*(.+?)(?=\s+(?:autore|author)\s*:|$)',
+        raw_query,
+        flags=re.IGNORECASE
+    )
+
+    author_match = re.search(
+        r'(?:^|\s)(?:autore|author)\s*:\s*(.+?)(?=\s+(?:titolo|title)\s*:|$)',
+        raw_query,
+        flags=re.IGNORECASE
+    )
+
+    if title_match:
+        title = title_match.group(1).strip().strip('"')
+
+    if author_match:
+        author = author_match.group(1).strip().strip('"')
+
+    if not title and not author:
+        folded = raw_query.casefold()
+
+        for candidate in sorted(known_authors, key=len, reverse=True):
+            pos = folded.rfind(candidate.casefold())
+
+            if pos >= 0:
+                before = raw_query[:pos].strip()
+                after = raw_query[pos + len(candidate):].strip()
+
+                if not after:
+                    title = before
+                    author = candidate
+                    break
+
+                if not before:
+                    author = candidate
+                    title = after
+                    break
+
     params = {
-        'q': query,
         'limit': min(max(int(limit), 1), 20),
-        'lang': 'it',
-        'fields': 'key,title,author_name,first_publish_year,publisher,subject,isbn,cover_i,language,first_sentence'
+        'fields': (
+            'key,title,author_name,first_publish_year,'
+            'publisher,subject,isbn,cover_i,first_sentence'
+        )
     }
+
+    if title and author:
+        params.update({
+            'title': title,
+            'author': author
+        })
+    elif author:
+        params['author'] = author
+    elif title:
+        params['title'] = title
+    else:
+        params['q'] = raw_query
 
     try:
         r = requests.get(
@@ -87,32 +158,30 @@ def search_books(query: str, limit=8) -> list[dict[str, str]]:
             },
             timeout=20
         )
+
+        if not r.ok:
+            log.error(
+                'Open Library HTTP %s: %s',
+                r.status_code,
+                r.text[:1000]
+            )
+
         r.raise_for_status()
 
         data = r.json()
         out = []
 
         for item in data.get('docs', []):
-            title = item.get('title') or 'Titolo non disponibile'
+            title_value = item.get('title') or 'Titolo non disponibile'
 
-            authors = ', '.join(
-                item.get('author_name', [])
-            )
+            authors = ', '.join(item.get('author_name') or [])
+            publishers = ', '.join((item.get('publisher') or [])[:3])
+            subjects = ', '.join((item.get('subject') or [])[:10])
 
-            publishers = ', '.join(
-                item.get('publisher', [])[:3]
-            )
-
-            subjects = ', '.join(
-                item.get('subject', [])[:10]
-            )
-
-            isbn = next(
-                iter(item.get('isbn', [])),
-                ''
-            )
+            isbn = next(iter(item.get('isbn') or []), '')
 
             sentences = item.get('first_sentence', [])
+
             if isinstance(sentences, list):
                 description = ' '.join(str(s) for s in sentences)
             elif isinstance(sentences, str):
@@ -127,7 +196,7 @@ def search_books(query: str, limit=8) -> list[dict[str, str]]:
             )
 
             out.append({
-                'title': title,
+                'title': title_value,
                 'authors': authors,
                 'publisher': publishers,
                 'published': str(item.get('first_publish_year', '')),
@@ -143,6 +212,7 @@ def search_books(query: str, limit=8) -> list[dict[str, str]]:
     except requests.exceptions.RequestException as e:
         log.exception('Open Library search failed: %s', e)
         raise
+
     except (ValueError, TypeError, KeyError) as e:
         log.exception('Open Library response error: %s', e)
         raise
