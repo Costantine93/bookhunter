@@ -391,10 +391,4 @@ def main():
     for h in handlers: app.add_handler(h)
     log.info('BookHunter avviato'); app.run_polling(allowed_updates=Update.ALL_TYPES)
 if __name__=='__main__': main()
-    if not TOKEN: raise SystemExit('Configura TELEGRAM_BOT_TOKEN')
-    if ALLOWED_ID==0: log.warning('ALLOWED_TELEGRAM_USER_ID non impostato: bot non limitato a un solo utente')
-    init_db(); app=Application.builder().token(TOKEN).post_init(post_init).build()
-    handlers=[CommandHandler('start',start),CommandHandler(['aiutami','help'],help_cmd),CommandHandler('cerca',search_cmd),CommandHandler('consiglio',recommendation_cmd),CommandHandler('wishlist',wishlist_cmd),CommandHandler('lettura',reading_cmd),CommandHandler('letto',read_cmd),CommandHandler('sospeso',suspended_cmd),CommandHandler('nonleggere',rejected_cmd),CommandHandler('libreria',library_cmd),CommandHandler('profilo',profile_cmd),CommandHandler('escludigenere',exclude_genre),CommandHandler('includigenere',include_genre),CommandHandler('escludiautore',exclude_author),CommandHandler('nuoveuscite',releases_cmd),CallbackQueryHandler(callback)]
-    for h in handlers: app.add_handler(h)
-    log.info('BookHunter avviato'); app.run_polling(allowed_updates=Update.ALL_TYPES)
-if __name__=='__main__': main()
+    
