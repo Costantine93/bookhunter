@@ -10,7 +10,8 @@ from html.parser import HTMLParser
 from urllib.parse import urljoin
 from dotenv import load_dotenv
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
-from telegram.ext import Application, CommandHandler, CallbackQueryHandler, ContextTypes
+from telegram.ext import Application, CommandHandler, CallbackQueryHandler, ContextTypes, MessageHandler, filters
+from gemini_librarian import generate_reply, extract_literary_memories, GeminiLibrarianError
 
 load_dotenv()
 TOKEN = os.getenv('TELEGRAM_BOT_TOKEN', '')
@@ -40,6 +41,8 @@ CREATE TABLE IF NOT EXISTS books (
  UNIQUE(title, authors));
 CREATE TABLE IF NOT EXISTS exclusions (kind TEXT NOT NULL, value TEXT NOT NULL, PRIMARY KEY(kind,value));
 CREATE TABLE IF NOT EXISTS seen_releases (id TEXT PRIMARY KEY, title TEXT, link TEXT, published TEXT, source TEXT, first_seen TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS chat_history (id INTEGER PRIMARY KEY AUTOINCREMENT, role TEXT NOT NULL, content TEXT NOT NULL, created_at TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS literary_memory (id INTEGER PRIMARY KEY AUTOINCREMENT, memory TEXT NOT NULL UNIQUE, created_at TEXT NOT NULL);
 '''
 
 def db():
@@ -267,7 +270,7 @@ def book_keyboard(b):
 
 async def start(update:Update, context:ContextTypes.DEFAULT_TYPE):
     if not await guard(update): return
-    await update.message.reply_text('📚 Benvenuto in BookHunter!\n\nIl tuo libraio personale: cerca libri, gestisci i tuoi scaffali, ricevi consigli AI basati sulle tue letture e scopri le novità editoriali.',reply_markup=InlineKeyboardMarkup([
+    await update.message.reply_text('📚 Benvenuto in BookHunter!\n\nIl tuo libraio personale: cerca libri, gestisci i tuoi scaffali, ricevi consigli personalizzati e conversa liberamente con il libraio AI.',reply_markup=InlineKeyboardMarkup([
       [InlineKeyboardButton('✨ Consigliami libri',callback_data='menu:recommend'),InlineKeyboardButton('🔎 Cerca libri',callback_data='menu:search')],
       [InlineKeyboardButton('❤️ Desidero leggere',callback_data='menu:wishlist'),InlineKeyboardButton('✅ Libri letti',callback_data='menu:library')],
       [InlineKeyboardButton('📖 In lettura',callback_data='menu:reading'),InlineKeyboardButton('👤 Il mio profilo',callback_data='menu:profile')],
@@ -275,7 +278,7 @@ async def start(update:Update, context:ContextTypes.DEFAULT_TYPE):
 
 async def help_cmd(update:Update,context:ContextTypes.DEFAULT_TYPE):
     if not await guard(update): return
-    await update.message.reply_text('/cerca <titolo, autore o tema>\n/consiglio [tema]\n/wishlist <titolo>\n/lettura <titolo>\n/letto <titolo> | <voto 1-5>\n/sospeso <titolo>\n/nonleggere <titolo>\n/libreria [desidero|lettura|letti|sospesi|esclusi]\n/profilo\n/nuoveuscite')
+    await update.message.reply_text('/cerca <titolo, autore o tema>\n/consiglio [tema]\n/wishlist <titolo>\n/lettura <titolo>\n/letto <titolo> | <voto 1-5>\n/sospeso <titolo>\n/nonleggere <titolo>\n/libreria [desidero|lettura|letti|sospesi|esclusi]\n/profilo\n/memoria\n/cancellamemoria\n/nuoveuscite')
 
 async def search_cmd(update:Update,context:ContextTypes.DEFAULT_TYPE):
     if not await guard(update): return
@@ -363,6 +366,132 @@ async def recommendation_cmd(update:Update,context:ContextTypes.DEFAULT_TYPE):
     except Exception as e:
         log.exception('free recommendation failed')
         await message.reply_text(f'Consigli non disponibili in questo momento ({type(e).__name__}). Nessun servizio a pagamento è stato contattato; riprova quando il catalogo è raggiungibile.')
+
+
+def literary_context():
+    """Prepara profilo, scaffali, memoria e cronologia per il libraio AI."""
+    with db() as con:
+        books = con.execute(
+            "SELECT title,authors,status,rating FROM books "
+            "WHERE status IN ('read','wishlist','reading') ORDER BY id DESC LIMIT 35"
+        ).fetchall()
+        memories = con.execute(
+            "SELECT memory FROM literary_memory ORDER BY id DESC LIMIT 30"
+        ).fetchall()
+        history = con.execute(
+            "SELECT role,content FROM chat_history ORDER BY id DESC LIMIT 10"
+        ).fetchall()
+
+    shelf_lines = []
+    labels = {'read': 'letto', 'wishlist': 'desiderato', 'reading': 'in lettura'}
+    for row in books:
+        rating = f", voto {row['rating']}/5" if row['rating'] else ''
+        shelf_lines.append(
+            f"- {row['title']} — {row['authors']} "
+            f"({labels.get(row['status'], row['status'])}{rating})"
+        )
+    memory_text = '\n'.join(f"- {row['memory']}" for row in memories)
+    shelf_text = '\n'.join(shelf_lines)
+    recent = [
+        {'role': row['role'], 'text': row['content']}
+        for row in reversed(history)
+    ]
+    return get_profile(), shelf_text, memory_text, recent
+
+
+async def chat_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Gestisce i messaggi testuali liberi con Gemini."""
+    if not await guard(update):
+        return
+    message = update.effective_message
+    user_text = (message.text or '').strip() if message else ''
+    if not user_text:
+        return
+    if not os.getenv('GEMINI_API_KEY', '').strip():
+        await message.reply_text(
+            "Il libraio AI non è ancora configurato. Verifica GEMINI_API_KEY su Railway."
+        )
+        return
+
+    profile, shelves, memories, history = literary_context()
+    try:
+        answer = generate_reply(
+            user_text,
+            literary_profile=profile,
+            shelf_context=shelves,
+            memory_context=memories,
+            history=history,
+        )
+        now = datetime.now(timezone.utc).isoformat()
+        with db() as con:
+            con.execute(
+                "INSERT INTO chat_history(role,content,created_at) VALUES('user',?,?)",
+                (user_text[:3500], now)
+            )
+            con.execute(
+                "INSERT INTO chat_history(role,content,created_at) VALUES('model',?,?)",
+                (answer[:6000], now)
+            )
+            con.execute(
+                "DELETE FROM chat_history WHERE id NOT IN "
+                "(SELECT id FROM chat_history ORDER BY id DESC LIMIT 30)"
+            )
+            user_turns = con.execute(
+                "SELECT COUNT(*) AS n FROM chat_history WHERE role='user'"
+            ).fetchone()['n']
+        # Estrazione periodica: limita le chiamate aggiuntive e salva solo gusti espliciti.
+        if user_turns % 4 == 0:
+            extracted = extract_literary_memories(user_text)
+            if extracted:
+                with db() as con:
+                    for item in extracted:
+                        con.execute(
+                            "INSERT OR IGNORE INTO literary_memory(memory,created_at) VALUES(?,?)",
+                            (item, datetime.now(timezone.utc).isoformat())
+                        )
+                    con.execute(
+                        "DELETE FROM literary_memory WHERE id NOT IN "
+                        "(SELECT id FROM literary_memory ORDER BY id DESC LIMIT 40)"
+                    )
+        for start in range(0, len(answer), 3900):
+            await message.reply_text(answer[start:start + 3900])
+    except GeminiLibrarianError as exc:
+        await message.reply_text(str(exc))
+    except Exception:
+        log.exception('Gemini chat error')
+        await message.reply_text(
+            "Il libraio AI ha avuto un problema inatteso. Riprova tra poco."
+        )
+
+
+async def memory_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await guard(update):
+        return
+    with db() as con:
+        rows = con.execute(
+            "SELECT memory FROM literary_memory ORDER BY id DESC LIMIT 30"
+        ).fetchall()
+    if not rows:
+        await update.effective_message.reply_text(
+            "🧠 Non ho ancora memorie letterarie salvate. "
+            "Parlando di libri e preferenze, potrò costruire il tuo profilo."
+        )
+        return
+    text = "🧠 **Memoria letteraria di BookHunter**\n\n" + '\n'.join(
+        f"• {row['memory']}" for row in rows
+    )
+    await update.effective_message.reply_text(text, parse_mode='Markdown')
+
+
+async def clear_memory_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await guard(update):
+        return
+    with db() as con:
+        con.execute("DELETE FROM literary_memory")
+        con.execute("DELETE FROM chat_history")
+    await update.effective_message.reply_text(
+        "Ho cancellato la memoria letteraria e la cronologia della chat di BookHunter."
+    )
 
 def saved_titles():
     with db() as con: return '; '.join(r['title'] for r in con.execute("SELECT title FROM books WHERE status IN ('wishlist','reading','read','rejected')"))
@@ -510,7 +639,7 @@ def main():
     if not TOKEN: raise SystemExit('Configura TELEGRAM_BOT_TOKEN')
     if ALLOWED_ID==0: log.warning('ALLOWED_TELEGRAM_USER_ID non impostato: bot non limitato a un solo utente')
     init_db(); app=Application.builder().token(TOKEN).post_init(post_init).build()
-    handlers=[CommandHandler('start',start),CommandHandler(['aiutami','help'],help_cmd),CommandHandler('cerca',search_cmd),CommandHandler('consiglio',recommendation_cmd),CommandHandler('wishlist',wishlist_cmd),CommandHandler('lettura',reading_cmd),CommandHandler('letto',read_cmd),CommandHandler('sospeso',suspended_cmd),CommandHandler('nonleggere',rejected_cmd),CommandHandler('libreria',library_cmd),CommandHandler('profilo',profile_cmd),CommandHandler('nuoveuscite',releases_cmd),CallbackQueryHandler(callback)]
+    handlers=[CommandHandler('start',start),CommandHandler(['aiutami','help'],help_cmd),CommandHandler('cerca',search_cmd),CommandHandler('consiglio',recommendation_cmd),CommandHandler('wishlist',wishlist_cmd),CommandHandler('lettura',reading_cmd),CommandHandler('letto',read_cmd),CommandHandler('sospeso',suspended_cmd),CommandHandler('nonleggere',rejected_cmd),CommandHandler('libreria',library_cmd),CommandHandler('profilo',profile_cmd),CommandHandler('nuoveuscite',releases_cmd),CommandHandler('memoria',memory_cmd),CommandHandler('cancellamemoria',clear_memory_cmd),MessageHandler(filters.TEXT & ~filters.COMMAND,chat_cmd),CallbackQueryHandler(callback)]
     for h in handlers: app.add_handler(h)
     log.info('BookHunter avviato'); app.run_polling(allowed_updates=Update.ALL_TYPES)
 if __name__=='__main__': main()
