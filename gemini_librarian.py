@@ -11,6 +11,8 @@ conversation history and literary context, and decides what to persist.
 from __future__ import annotations
 
 import os
+import json
+import re
 import requests
 
 DEFAULT_MODEL = "gemini-3.1-flash-lite"
@@ -125,3 +127,52 @@ def generate_reply(
             "Gemini ha restituito una risposta vuota. Riprova."
         )
     return answer
+
+
+def extract_literary_memories(user_message: str) -> list[str]:
+    """Extract only explicit, durable literary preferences from a user message."""
+    api_key = os.getenv("GEMINI_API_KEY", "").strip()
+    if not api_key:
+        return []
+    model = os.getenv("GEMINI_MODEL", DEFAULT_MODEL).strip() or DEFAULT_MODEL
+    instruction = (
+        "Estrai esclusivamente preferenze letterarie durevoli esplicitamente "
+        "dichiarate dall'utente: autori amati o non graditi, generi, temi, stile, "
+        "lingua, formato e abitudini di lettura. Non dedurre gusti da semplici "
+        "domande su un libro. Ignora dati personali e ogni informazione sensibile. "
+        "Restituisci SOLO JSON valido nel formato "
+        '{"memories":["preferenza 1","preferenza 2"]}. Massimo 3 elementi. '
+        "Se non c'è una preferenza esplicita e durevole, usa un array vuoto."
+    )
+    url = f"{API_ROOT}{model}:generateContent"
+    try:
+        response = requests.post(
+            url,
+            params={"key": api_key},
+            json={
+                "system_instruction": {"parts": [{"text": instruction}]},
+                "contents": [{"role": "user", "parts": [{"text": user_message[:1800]}]}],
+                "generationConfig": {"temperature": 0.1, "maxOutputTokens": 180},
+            },
+            headers={"Content-Type": "application/json"},
+            timeout=(10, 35),
+        )
+        if response.status_code != 200:
+            return []
+        raw = "".join(
+            part.get("text", "")
+            for part in response.json()["candidates"][0]["content"]["parts"]
+        )
+        match = re.search(r"\{.*\}", raw, flags=re.DOTALL)
+        if not match:
+            return []
+        parsed = json.loads(match.group(0))
+        values = parsed.get("memories", [])
+        if not isinstance(values, list):
+            return []
+        return [
+            value.strip() for value in values[:3]
+            if isinstance(value, str) and 8 <= len(value.strip()) <= 240
+        ]
+    except Exception:
+        return []
