@@ -24,3 +24,8 @@ jobs:
           python -m py_compile main.py
           python -m py_compile book_catalog.py
           python -m py_compile gemini_librarian.py
+
+      - name: Esegue i test automatici
+        run: |
+          python -m pip install requests
+          python -m unittest discover -s tests -v
