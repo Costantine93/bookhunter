@@ -442,7 +442,7 @@ async def chat_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 "DELETE FROM chat_history WHERE id NOT IN "
                 "(SELECT id FROM chat_history ORDER BY id DESC LIMIT 30)"
             )
-                        con.execute(
+            con.execute(
                 "INSERT OR IGNORE INTO profile(key,value) VALUES('chat_turns','0')"
             )
             con.execute(
