@@ -307,6 +307,7 @@ def _identity(book):
     return "title:" + _norm(book.get("title", "")) + "|" + _norm(book.get("authors", ""))
 
 
+
 def _merge(items, query, limit):
     merged = {}
     for book in items:
@@ -315,24 +316,77 @@ def _merge(items, query, limit):
             merged[key] = dict(book)
             continue
         old = merged[key]
-        for field in ("title", "authors", "publisher", "published", "description",
-                      "categories", "isbn", "link", "cover", "language"):
+        for field in ("title", "authors", "publisher", "published",
+                      "description", "categories", "isbn", "link",
+                      "cover", "language"):
             if not old.get(field) and book.get(field):
                 old[field] = book[field]
-        old["italian_verified"] = bool(old.get("italian_verified") or book.get("italian_verified"))
+        old["italian_verified"] = bool(
+            old.get("italian_verified") or book.get("italian_verified")
+        )
         sources = set(str(old.get("source", "")).split(" + "))
         sources.update(str(book.get("source", "")).split(" + "))
         old["source"] = " + ".join(sorted(s for s in sources if s))
-    tokens = [t for t in _norm(query).split() if len(t) > 1]
-    results = list(merged.values())
+
+    raw = (query or "").strip()
+    normalized = _norm(raw)
+    title_query = normalized
+    author_query = ""
+
+    if "|" in raw:
+        parts = raw.split("|", 1)
+        title_query = _norm(parts[0])
+        author_query = _norm(parts[1])
+    elif " di " in normalized:
+        title_query, author_query = normalized.rsplit(" di ", 1)
+
+    title_tokens = [
+        t for t in title_query.split()
+        if len(t) > 2 or t.isdigit()
+    ]
+    author_tokens = [
+        t for t in author_query.split()
+        if len(t) > 2
+    ]
+
     def score(book):
         title = _norm(book.get("title", ""))
         author = _norm(book.get("authors", ""))
-        other = _norm(book.get("publisher", "") + " " + book.get("categories", "") + " " + book.get("description", ""))
-        points = sum(4 if t in title else 3 if t in author else 1 if t in other else 0 for t in tokens)
-        return points + (2 if book.get("italian_verified") else 0)
-    results.sort(key=lambda b: (not b.get("italian_verified"), -score(b), _norm(b.get("title", ""))))
+        points = 0
+
+        if title_query and title == title_query:
+            points += 100
+        elif title_query and title_query in title:
+            points += 60
+
+        if title_tokens:
+            matches = sum(t in title.split() for t in title_tokens)
+            if matches == len(title_tokens):
+                points += 40
+            else:
+                points += matches * 8
+                points -= (len(title_tokens) - matches) * 15
+
+        if author_tokens:
+            matches = sum(t in author for t in author_tokens)
+            points += matches * 12
+            points -= (len(author_tokens) - matches) * 12
+
+        if book.get("italian_verified"):
+            points += 5
+
+        return points
+
+    results = list(merged.values())
+    results.sort(
+        key=lambda b: (
+            -score(b),
+            not b.get("italian_verified"),
+            _norm(b.get("title", ""))
+        )
+    )
     return results[:min(max(int(limit), 1), 20)]
+
 
 
 def search_books(query: str, limit: int = 8):
