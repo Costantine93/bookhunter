@@ -442,9 +442,16 @@ async def chat_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 "DELETE FROM chat_history WHERE id NOT IN "
                 "(SELECT id FROM chat_history ORDER BY id DESC LIMIT 30)"
             )
-            user_turns = con.execute(
-                "SELECT COUNT(*) AS n FROM chat_history WHERE role='user'"
-            ).fetchone()['n']
+                        con.execute(
+                "INSERT OR IGNORE INTO profile(key,value) VALUES('chat_turns','0')"
+            )
+            con.execute(
+                "UPDATE profile SET value = CAST(value AS INTEGER) + 1 "
+                "WHERE key='chat_turns'"
+            )
+            user_turns = int(con.execute(
+                "SELECT value FROM profile WHERE key='chat_turns'"
+            ).fetchone()['value'])
         # Estrazione periodica: limita le chiamate aggiuntive e salva solo gusti espliciti.
         if user_turns % 4 == 0:
             extracted = extract_literary_memories(user_text)
