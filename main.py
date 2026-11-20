@@ -12,7 +12,7 @@ from dotenv import load_dotenv
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, CallbackQueryHandler, ContextTypes, MessageHandler, filters
 from gemini_librarian import generate_reply, extract_literary_memories, GeminiLibrarianError
-
+from book_catalog import search_books as catalog_search_books
 load_dotenv()
 TOKEN = os.getenv('TELEGRAM_BOT_TOKEN', '')
 ALLOWED_ID = int(os.getenv('ALLOWED_TELEGRAM_USER_ID', '0') or 0)
@@ -230,7 +230,13 @@ def search_books(query: str, limit=8) -> list[dict[str, str]]:
     return results
 
 
-
+def search_books(query: str, limit=8) -> list[dict[str, str]]:
+    """Cerca libri nei cataloghi Google Books e Open Library."""
+    try:
+        return catalog_search_books(query, limit=limit)
+    except Exception as exc:
+        log.exception("Errore durante la ricerca nel catalogo libri: %s", exc)
+        return []
 def blocked(book: dict[str, str]) -> bool:
     return False
 
