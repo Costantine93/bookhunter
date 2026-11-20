@@ -12,7 +12,7 @@ from dotenv import load_dotenv
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, CallbackQueryHandler, ContextTypes, MessageHandler, filters
 from gemini_librarian import generate_reply, extract_literary_memories, GeminiLibrarianError
-
+from book_catalog import search_books as catalog_search_books
 load_dotenv()
 TOKEN = os.getenv('TELEGRAM_BOT_TOKEN', '')
 ALLOWED_ID = int(os.getenv('ALLOWED_TELEGRAM_USER_ID', '0') or 0)
@@ -230,7 +230,13 @@ def search_books(query: str, limit=8) -> list[dict[str, str]]:
     return results
 
 
-
+def search_books(query: str, limit=8) -> list[dict[str, str]]:
+    """Cerca libri nei cataloghi Google Books e Open Library."""
+    try:
+        return catalog_search_books(query, limit=limit)
+    except Exception as exc:
+        log.exception("Errore durante la ricerca nel catalogo libri: %s", exc)
+        return []
 def blocked(book: dict[str, str]) -> bool:
     return False
 
@@ -436,9 +442,16 @@ async def chat_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 "DELETE FROM chat_history WHERE id NOT IN "
                 "(SELECT id FROM chat_history ORDER BY id DESC LIMIT 30)"
             )
-            user_turns = con.execute(
-                "SELECT COUNT(*) AS n FROM chat_history WHERE role='user'"
-            ).fetchone()['n']
+            con.execute(
+                "INSERT OR IGNORE INTO profile(key,value) VALUES('chat_turns','0')"
+            )
+            con.execute(
+                "UPDATE profile SET value = CAST(value AS INTEGER) + 1 "
+                "WHERE key='chat_turns'"
+            )
+            user_turns = int(con.execute(
+                "SELECT value FROM profile WHERE key='chat_turns'"
+            ).fetchone()['value'])
         # Estrazione periodica: limita le chiamate aggiuntive e salva solo gusti espliciti.
         if user_turns % 4 == 0:
             extracted = extract_literary_memories(user_text)
@@ -615,9 +628,25 @@ async def releases_cmd_from_message(message):
                     items.append((f'{title} — {published}',link,feed.feed.get('title','Feed editoriale')))
         except Exception as e:
             log.warning('Feed novita non disponibile %s: %s',url,e)
+             # Catalogo Google Books: pubblicazioni recenti, non necessariamente prime uscite.
+    try:
+        from book_catalog import search_recent_books
+        for book in search_recent_books(limit=8):
+            link = book.get('link', '')
+            if link and not any(existing[1] == link for existing in items):
+                title = book.get('title', 'Titolo non disponibile')
+                published = book.get('published', '')
+                authors = book.get('authors', '')
+                details = ' — '.join(x for x in (authors, published) if x)
+                if details:
+                    title = f'{title} — {details}'
+                source = 'Google Books' + (f' · {book["publisher"]}' if book.get('publisher') else '')
+                items.append((title, link, source))
+    except Exception as e:
+        log.warning('Google Books novità non disponibile: %s', e)
     if not items:
         return await message.reply_text('Non riesco a raggiungere in questo momento le fonti editoriali. Riprova più tardi; non mostro titoli non verificati.')
-    await message.reply_text('🆕 **Nuovi arrivi e novità editoriali**\nFonte principale: Messaggerie Libri. Le schede distinguono le novità dalle ristampe.',parse_mode='Markdown')
+    await message.reply_text('🆕 **Nuovi arrivi e novità editoriali**\nFonti: Messaggerie Libri e Google Books. I risultati Google Books sono pubblicazioni recenti presenti nel catalogo, non necessariamente prime uscite.',parse_mode='Markdown')
     for title,link,source in items[:10]:
         await message.reply_text(f'📚 {title}\nFonte: {source}\n{link}',disable_web_page_preview=True)
 
