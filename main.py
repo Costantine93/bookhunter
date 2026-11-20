@@ -621,9 +621,25 @@ async def releases_cmd_from_message(message):
                     items.append((f'{title} — {published}',link,feed.feed.get('title','Feed editoriale')))
         except Exception as e:
             log.warning('Feed novita non disponibile %s: %s',url,e)
+             # Catalogo Google Books: pubblicazioni recenti, non necessariamente prime uscite.
+    try:
+        from book_catalog import search_recent_books
+        for book in search_recent_books(limit=8):
+            link = book.get('link', '')
+            if link and not any(existing[1] == link for existing in items):
+                title = book.get('title', 'Titolo non disponibile')
+                published = book.get('published', '')
+                authors = book.get('authors', '')
+                details = ' — '.join(x for x in (authors, published) if x)
+                if details:
+                    title = f'{title} — {details}'
+                source = 'Google Books' + (f' · {book["publisher"]}' if book.get('publisher') else '')
+                items.append((title, link, source))
+    except Exception as e:
+        log.warning('Google Books novità non disponibile: %s', e)
     if not items:
         return await message.reply_text('Non riesco a raggiungere in questo momento le fonti editoriali. Riprova più tardi; non mostro titoli non verificati.')
-    await message.reply_text('🆕 **Nuovi arrivi e novità editoriali**\nFonte principale: Messaggerie Libri. Le schede distinguono le novità dalle ristampe.',parse_mode='Markdown')
+    await message.reply_text('🆕 **Nuovi arrivi e novità editoriali**\nFonti: Messaggerie Libri e Google Books. I risultati Google Books sono pubblicazioni recenti presenti nel catalogo, non necessariamente prime uscite.',parse_mode='Markdown')
     for title,link,source in items[:10]:
         await message.reply_text(f'📚 {title}\nFonte: {source}\n{link}',disable_web_page_preview=True)
 
