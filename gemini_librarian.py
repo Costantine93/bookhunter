@@ -13,6 +13,8 @@ from __future__ import annotations
 import os
 import json
 import re
+from datetime import datetime
+from zoneinfo import ZoneInfo
 import requests
 
 DEFAULT_MODEL = "gemini-3.1-flash-lite"
@@ -41,8 +43,10 @@ def generate_reply(
         )
 
     model = os.getenv("GEMINI_MODEL", DEFAULT_MODEL).strip() or DEFAULT_MODEL
+  current_date = datetime.now(ZoneInfo("Europe/Rome")).strftime("%d/%m/%Y")
     system_instruction = (
         "Sei BookHunter, un libraio italiano esperto, colto, caloroso e appassionato. "
+        f"La data odierna è {current_date}. Considerala sempre come riferimento temporale. "
         "Rispondi in italiano naturale. Ascolta il lettore, fai domande quando servono "
         "e motiva i consigli senza essere pomposo. Puoi discutere libri, autori, trame, "
         "personaggi, temi, stili e percorsi di lettura. Distingui i fatti dalle "
