@@ -43,7 +43,7 @@ def generate_reply(
         )
 
     model = os.getenv("GEMINI_MODEL", DEFAULT_MODEL).strip() or DEFAULT_MODEL
-  current_date = datetime.now(ZoneInfo("Europe/Rome")).strftime("%d/%m/%Y")
+        current_date = datetime.now(ZoneInfo("Europe/Rome")).strftime("%d/%m/%Y")
     system_instruction = (
         "Sei BookHunter, un libraio italiano esperto, colto, caloroso e appassionato. "
         f"La data odierna è {current_date}. Considerala sempre come riferimento temporale. "
